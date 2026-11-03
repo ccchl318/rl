@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.pyc
+
+# 训练产物：last.pt 为周期性快照（科学信息已由 best.pt 覆盖），不进仓库以控制体积
+results/
+
+# 编译缓存
+.cache/

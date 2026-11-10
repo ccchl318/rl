@@ -63,6 +63,8 @@ def parse_args():
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--results-dir", type=str, default=os.path.join(os.path.dirname(__file__), "results"))
+    p.add_argument("--init-from", type=str, default=None,
+                   help="从 checkpoint 载入模型权重继续训练（优化器与 lr/熵调度全新开始；用于微调/复热）")
     return p.parse_args()
 
 
@@ -115,6 +117,11 @@ def main():
             mask_list.append(env.action_mask())
 
     model = ActorCritic(hidden=args.hidden).to(device)
+    if args.init_from:
+        sd = torch.load(args.init_from, map_location=device)
+        model.load_state_dict(sd["model"])
+        print(f"[{args.run_name}] 从 {args.init_from} 载入模型权重 (来源 it={sd.get('it')})，"
+              f"优化器与调度全新开始", flush=True)
     # CUDA 图路径：fast 环境 + GPU 更新 + minibatch 整除（形状全静态才能捕获）
     use_graph = (args.env == "fast" and device.type == "cuda" and not args.no_graph
                  and (args.n_envs * args.steps) % args.minibatch_size == 0)

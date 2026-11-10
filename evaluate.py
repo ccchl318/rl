@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from game2048_env import Game2048Env3x3, ACTION_MEANING
-from ppo import ActorCritic, run_greedy_episodes
+from ppo import ActorCritic, run_greedy_episodes, run_greedy_episodes_fast
 
 
 def parse_args():
@@ -28,6 +28,8 @@ def parse_args():
     p.add_argument("--episodes", type=int, default=200)
     p.add_argument("--seed", type=int, default=555)
     p.add_argument("--device", type=str, default="cpu")
+    p.add_argument("--env", choices=["serial", "fast"], default="serial",
+                   help="fast=批量并行评估（逐局等价，快约一个量级；不输出最优局棋谱）")
     p.add_argument("--tag", type=str, default=None, help="输出文件名后缀")
     return p.parse_args()
 
@@ -146,11 +148,19 @@ def main():
         model = ActorCritic(hidden=ckpt["args"]["hidden"]).to(args.device)
         model.load_state_dict(ckpt["model"])
         model.eval()
-        res = run_greedy_episodes(model, args.episodes, seed=args.seed,
-                                  device=args.device, record=True)
-        raw = res.pop("raw")
-        best_ep = res.pop("best_episode")
-        model_desc = f"PPO greedy policy ({os.path.basename(args.ckpt)}, iter {ckpt['it']})"
+        if args.env == "fast":
+            res = run_greedy_episodes_fast(model, args.episodes,
+                                           seed=args.seed, device=args.device)
+            raw = res
+            best_ep = None
+            model_desc = (f"PPO greedy policy ({os.path.basename(args.ckpt)}, "
+                          f"iter {ckpt['it']}, batched eval)")
+        else:
+            res = run_greedy_episodes(model, args.episodes, seed=args.seed,
+                                      device=args.device, record=True)
+            raw = res.pop("raw")
+            best_ep = res.pop("best_episode")
+            model_desc = f"PPO greedy policy ({os.path.basename(args.ckpt)}, iter {ckpt['it']})"
 
     stats = summarize(raw, args.episodes)
     tile_counter = Counter(raw["max_tile"])

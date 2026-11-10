@@ -1,8 +1,15 @@
 """PPO 训练脚本：同步向量化环境采集 -> GAE -> PPO-clip 更新。
 
 用法示例：
-    python train.py --run-name main --iters 3000
+    python train.py --run-name main --iters 3000                # 默认 fast 环境 + CPU rollout
+    python train.py --env py --device cuda --run-name legacy    # 完全复现旧的逐环境实现
     python train.py --run-name ablation_low_ent --iters 400 --ent-coef 0.002 --ent-final 0.0002
+
+环境选择（--env）：
+    fast  向量化查表环境（game2048_env_fast.py，语义与 py 逐位等价，吞吐高一个量级以上）
+    py    旧逐环境实现（game2048_env.py），行为与历史实验完全一致
+设备（--device 管 PPO 更新；--rollout-device 管 rollout 推理，默认 CPU——144→256→256
+的小网络在 CPU 上推理更快，且多进程并发训练时不再挤占 GPU）。
 
 输出（位于 results/<run-name>/）：
     train_log.csv   每次迭代的训练统计（最近 100 局滑窗均值）
@@ -20,7 +27,10 @@ import numpy as np
 import torch
 
 from game2048_env import Game2048Env3x3, ACTION_MEANING
-from ppo import ActorCritic, compute_gae, ppo_update, run_greedy_episodes
+from game2048_env_fast import FastGame2048Batch
+from gpu_graph import GraphedPolicy, GraphedUpdater
+from ppo import (ActorCritic, compute_gae, ppo_update, run_greedy_episodes,
+                 run_greedy_episodes_fast)
 
 
 def parse_args():
@@ -42,6 +52,12 @@ def parse_args():
     p.add_argument("--ent-final", type=float, default=0.002, help="熵系数终值")
     p.add_argument("--reward-scale", type=float, default=0.25, help="奖励 = 合并得分 * reward_scale")
     p.add_argument("--no-mask", action="store_true", help="消融：不使用动作掩码")
+    p.add_argument("--env", choices=["fast", "py"], default="fast",
+                   help="fast=向量化查表环境（默认）；py=旧逐环境实现（完全复现旧行为）")
+    p.add_argument("--rollout-device", type=str, default="cpu",
+                   help="rollout 推理设备（仅 --no-graph 或 CPU 训练时生效；默认 CUDA 图路径下推理在 GPU 重放）")
+    p.add_argument("--no-graph", action="store_true",
+                   help="禁用 CUDA Graph（推理图+更新图），退回逐算子执行")
     p.add_argument("--eval-every", type=int, default=25)
     p.add_argument("--eval-episodes", type=int, default=50)
     p.add_argument("--seed", type=int, default=1)
@@ -85,16 +101,44 @@ def main():
     rng = np.random.default_rng(args.seed)
 
     device = torch.device(args.device)
-    envs = [Game2048Env3x3() for _ in range(args.n_envs)]
-    obs_list, mask_list = [], []
-    for i, env in enumerate(envs):
-        obs, _ = env.reset(seed=args.seed * 10_000 + i)
-        obs_list.append(obs)
-        mask_list.append(env.action_mask())
+    rollout_device = torch.device(args.rollout_device)
+    if args.env == "fast":
+        benv = FastGame2048Batch(args.n_envs, seed=args.seed,
+                                 reward_scale=args.reward_scale)
+        envs = None
+    else:
+        envs = [Game2048Env3x3() for _ in range(args.n_envs)]
+        obs_list, mask_list = [], []
+        for i, env in enumerate(envs):
+            obs, _ = env.reset(seed=args.seed * 10_000 + i)
+            obs_list.append(obs)
+            mask_list.append(env.action_mask())
 
     model = ActorCritic(hidden=args.hidden).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    buffer = RolloutBuffer(args.n_envs, args.steps, envs[0].observation_space.shape[0], device)
+    # CUDA 图路径：fast 环境 + GPU 更新 + minibatch 整除（形状全静态才能捕获）
+    use_graph = (args.env == "fast" and device.type == "cuda" and not args.no_graph
+                 and (args.n_envs * args.steps) % args.minibatch_size == 0)
+    if use_graph:
+        # fused Adam：图外每次 minibatch 一次融合 kernel；lr 退火仍然每迭代生效
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, fused=True)
+        buffer_device = torch.device("cpu")  # rollout 期间 buffer 常驻 CPU，迭代末一次 H2D
+        roller = GraphedPolicy(model, args.n_envs, device, seed=args.seed + 1)
+        updater = GraphedUpdater(model, optimizer, args.n_envs * args.steps,
+                                 args.minibatch_size, args.vf_coef, args.clip,
+                                 device, epochs=args.epochs)
+        mask_all = np.ones((args.n_envs, 4), dtype=bool)  # --no-mask 用的全真掩码
+        rollout_model = None
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        buffer_device = device
+        # fast 路径 rollout 推理设备与更新设备不同时，维护一份推理权重镜像（每次更新后同步）
+        if args.env == "fast" and rollout_device.type != device.type:
+            rollout_model = ActorCritic(hidden=args.hidden).to(rollout_device)
+            rollout_model.eval()
+        else:
+            rollout_model = None
+    obs_dim = envs[0].observation_space.shape[0] if envs is not None else benv.obs.shape[1]
+    buffer = RolloutBuffer(args.n_envs, args.steps, obs_dim, buffer_device)
 
     # 每个环境的局内统计
     ep_score = np.zeros(args.n_envs)
@@ -119,7 +163,8 @@ def main():
                     "optimizer": optimizer.state_dict(), "args": vars(args)},
                    os.path.join(out_dir, name))
 
-    print(f"[{args.run_name}] device={device}, 每迭代 {args.n_envs * args.steps} 步, "
+    print(f"[{args.run_name}] device={device} env={args.env} cuda_graph={'on' if use_graph else 'off'}, "
+          f"每迭代 {args.n_envs * args.steps} 步, "
           f"共 {args.iters} 迭代 (≈{args.iters * args.n_envs * args.steps / 1e6:.1f}M 步)")
     t_start = time.time()
     for it in range(1, args.iters + 1):
@@ -132,46 +177,94 @@ def main():
 
         model.eval()
         with torch.no_grad():
-            for t in range(args.steps):
-                obs_batch = torch.from_numpy(np.stack(obs_list)).to(device)
-                mask_batch = torch.ones(args.n_envs, 4, dtype=torch.bool, device=device) \
-                    if args.no_mask else torch.tensor(np.stack(mask_list), dtype=torch.bool, device=device)
-                act, logp = model.act(obs_batch, mask_batch)
-                vals = model.value(obs_batch)
-
-                buffer.obs[t] = obs_batch
-                buffer.mask[t] = mask_batch
-                buffer.act[t] = act
-                buffer.logp[t] = logp
-                buffer.val[t] = vals
-
-                act_np = act.cpu().numpy()
-                for i, env in enumerate(envs):
-                    obs, rew, term, trunc, info = env.step(int(act_np[i]))
-                    buffer.rew[t, i] = rew * args.reward_scale
-                    buffer.done[t, i] = float(term or trunc)
-                    ep_score[i] += rew
-                    ep_len[i] += 1
-                    if term or trunc:
-                        recent.append((ep_score[i], info["max_tile"],
-                                       info["board_sum"], ep_len[i]))
+            if use_graph:
+                # 图重放路径：buffer 常驻 CPU，无逐时间步 H2D；动作 D2H 仅 1.25KB
+                mask_in = benv.mask if not args.no_mask else mask_all
+                for t in range(args.steps):
+                    act, logp, vals = roller.infer(benv.obs, mask_in)
+                    buffer.obs[t] = torch.from_numpy(benv.obs)
+                    buffer.mask[t] = torch.from_numpy(mask_in)
+                    buffer.act[t] = torch.from_numpy(act)
+                    buffer.logp[t] = torch.from_numpy(logp)
+                    buffer.val[t] = torch.from_numpy(vals)
+                    rew, done = benv.step(act)
+                    buffer.rew[t] = rew
+                    buffer.done[t] = done
+                    for _, stat in benv.pop_finished():
+                        recent.append(stat)
                         total_episodes += 1
-                        ep_score[i], ep_len[i] = 0.0, 0
-                        obs, _ = env.reset()
-                    obs_list[i] = obs
-                    mask_list[i] = env.action_mask()
-                total_steps += args.n_envs
+            elif args.env == "fast":
+                infer_model = rollout_model if rollout_model is not None else model
+                for t in range(args.steps):
+                    obs_batch = torch.from_numpy(benv.obs).to(rollout_device)
+                    mask_batch = torch.ones(args.n_envs, 4, dtype=torch.bool,
+                                            device=rollout_device) \
+                        if args.no_mask else torch.from_numpy(benv.mask).to(rollout_device)
+                    act, logp, vals = infer_model.act_and_value(obs_batch, mask_batch)
+                    buffer.obs[t] = obs_batch.to(device)
+                    buffer.mask[t] = mask_batch.to(device)
+                    buffer.act[t] = act.to(device)
+                    buffer.logp[t] = logp.to(device)
+                    buffer.val[t] = vals.to(device)
+                    rew, done = benv.step(act.cpu().numpy())
+                    buffer.rew[t] = rew
+                    buffer.done[t] = done
+                    for _, stat in benv.pop_finished():
+                        recent.append(stat)
+                        total_episodes += 1
+            else:
+                for t in range(args.steps):
+                    obs_batch = torch.from_numpy(np.stack(obs_list)).to(device)
+                    mask_batch = torch.ones(args.n_envs, 4, dtype=torch.bool, device=device) \
+                        if args.no_mask else torch.tensor(np.stack(mask_list), dtype=torch.bool, device=device)
+                    act, logp = model.act(obs_batch, mask_batch)
+                    vals = model.value(obs_batch)
+
+                    buffer.obs[t] = obs_batch
+                    buffer.mask[t] = mask_batch
+                    buffer.act[t] = act
+                    buffer.logp[t] = logp
+                    buffer.val[t] = vals
+
+                    act_np = act.cpu().numpy()
+                    for i, env in enumerate(envs):
+                        obs, rew, term, trunc, info = env.step(int(act_np[i]))
+                        buffer.rew[t, i] = rew * args.reward_scale
+                        buffer.done[t, i] = float(term or trunc)
+                        ep_score[i] += rew
+                        ep_len[i] += 1
+                        if term or trunc:
+                            recent.append((ep_score[i], info["max_tile"],
+                                           info["board_sum"], ep_len[i]))
+                            total_episodes += 1
+                            ep_score[i], ep_len[i] = 0.0, 0
+                            obs, _ = env.reset()
+                        obs_list[i] = obs
+                        mask_list[i] = env.action_mask()
+                    total_steps += args.n_envs
 
         # bootstrap 末端价值
         with torch.no_grad():
-            obs_batch = torch.from_numpy(np.stack(obs_list)).to(device)
-            last_values = model.value(obs_batch).cpu().numpy()
+            if use_graph:
+                last_values = roller.value_only(benv.obs)
+            else:
+                obs_final = torch.from_numpy(benv.obs) if args.env == "fast" \
+                    else torch.from_numpy(np.stack(obs_list))
+                last_values = model.value(obs_final.to(device)).cpu().numpy()
         adv, ret = compute_gae(buffer.rew, buffer.val.cpu().numpy(), buffer.done,
                                last_values, args.gamma, args.lam)
 
         model.train()
-        stats = ppo_update(model, optimizer, buffer.flat(adv, ret), args.clip,
-                           args.epochs, args.minibatch_size, args.vf_coef, ent_now)
+        if use_graph:
+            # 图重放更新：gather->loss->backward 在图内，clip+fused Adam 在图外；
+            # batch 仍在 CPU，update() 内部做每迭代一次的集中 H2D
+            stats = updater.update(buffer.flat(adv, ret), ent_now)
+        else:
+            stats = ppo_update(model, optimizer, buffer.flat(adv, ret), args.clip,
+                               args.epochs, args.minibatch_size, args.vf_coef, ent_now)
+        if rollout_model is not None:
+            rollout_model.load_state_dict(model.state_dict())
+            rollout_model.eval()
         total_steps = it * args.n_envs * args.steps
 
         if recent:
@@ -193,9 +286,10 @@ def main():
                   f"sum {tr[3]:6.1f} | len {tr[4]:5.1f} | ent {stats['entropy']:.2f} | "
                   f"kl {stats['kl']:.3f} | v_l {stats['v_loss']:.1f}", flush=True)
 
-        # 周期性贪心评估（固定种子保证各次评估可比）
+        # 周期性贪心评估（固定种子保证各次评估可比；fast 批量评估与串行逐局等价）
         if it % args.eval_every == 0 or it == args.iters:
-            ev = run_greedy_episodes(model, args.eval_episodes, seed=12345, device=device)
+            eval_fn = run_greedy_episodes_fast if args.env == "fast" else run_greedy_episodes
+            ev = eval_fn(model, args.eval_episodes, seed=12345, device=device)
             metric = ev["board_sum"][0] + 250.0 * ev["p>=256"][0]  # 综合作业目标选最优
             eval_writer.writerow([it, total_steps,
                                   f"{ev['score'][0]:.1f}", f"{ev['score'][1]:.1f}",

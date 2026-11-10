@@ -57,6 +57,17 @@ class ActorCritic(nn.Module):
             action = dist.sample()
         return action, dist.log_prob(action)
 
+    @torch.no_grad()
+    def act_and_value(self, obs: torch.Tensor, mask: torch.Tensor,
+                      deterministic: bool = False):
+        """动作/log_prob/价值一次调用产出（rollout 用，减少每时间步的派发开销）。"""
+        dist = Categorical(logits=self.policy_logits(obs, mask))
+        if deterministic:
+            action = torch.argmax(dist.probs, dim=-1)
+        else:
+            action = dist.sample()
+        return action, dist.log_prob(action), self.v_net(obs).squeeze(-1)
+
 
 def compute_gae(rewards, values, dones, last_values, gamma: float, lam: float):
     """广义优势估计 (GAE-lambda)。
@@ -162,4 +173,38 @@ def run_greedy_episodes(model: ActorCritic, n_episodes: int, seed: int = 12345,
     if record:
         out["best_episode"] = best
         out["raw"] = {k: list(v) for k, v in results.items()}
+    return out
+
+
+@torch.no_grad()
+def run_greedy_episodes_fast(model: ActorCritic, n_episodes: int, seed: int = 12345,
+                             device: str = "cpu", batch: int = 256):
+    """批量贪心评估：n_episodes 局并行执行，第 j 局固定种子 seed+j（per_env RNG 与
+    旧环境逐位一致），结果与 run_greedy_episodes 完全等价，只是快得多。"""
+    from game2048_env_fast import FastGame2048Batch
+
+    model.eval()
+    results = defaultdict(list)
+    n_done = 0
+    while n_done < n_episodes:
+        b = min(batch, n_episodes - n_done)
+        env = FastGame2048Batch(b, seeds=[seed + n_done + i for i in range(b)])
+        alive = np.ones(b, dtype=bool)
+        while alive.any():
+            obs = torch.from_numpy(env.obs).to(device)
+            mask = torch.from_numpy(env.mask).to(device)
+            act, _, _ = model.act_and_value(obs, mask, deterministic=True)
+            env.step(act.cpu().numpy())
+            for i, stat in env.pop_finished():
+                if alive[i]:
+                    alive[i] = False
+                    sc, mt, bs, ln = stat
+                    results["score"].append(sc)
+                    results["max_tile"].append(mt)
+                    results["board_sum"].append(bs)
+                    results["length"].append(ln)
+        n_done += b
+    out = {k: (float(np.mean(v)), float(np.std(v))) for k, v in results.items()}
+    for t in (128, 256, 512, 1024):
+        out[f"p>={t}"] = (float(np.mean([m >= t for m in results["max_tile"]])), 0.0)
     return out

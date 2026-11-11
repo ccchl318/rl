@@ -109,6 +109,18 @@ class FastGame2048Batch:
         """取走已结束对局的统计列表 [(env_idx, (score, max_tile, board_sum, len))]。"""
         out, self._finished = self._finished, []
         return out
+    def set_states(self, idx, cells):
+        """将（部分）环境设置为给定等级棋盘，清零局内簿记并刷新掩码/编码。
+
+        供状态级分支采样（GRPO 式组内对比）从训练 buffer 恢复状态使用。
+        """
+        idx = np.asarray(idx, dtype=np.int64)
+        cells = np.asarray(cells, dtype=np.int64)
+        self.cells[idx] = cells
+        self._score[idx] = 0.0
+        self._len[idx] = 0
+        self._refresh_mask(idx)
+        self._encode(idx)
 
     def step(self, actions):
         """批量执行一步。actions: (N,) int；返回 (rewards, dones)，均为 (N,)。

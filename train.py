@@ -86,6 +86,12 @@ def parse_args():
                    help="主调度结束后的精修迭代数（lr 恒定 --extend-lr，熵固定在终值）")
     p.add_argument("--extend-lr", type=float, default=6e-5,
                    help="精修阶段的恒定学习率")
+    p.add_argument("--extend2-iters", type=int, default=0,
+                   help="第三阶段（超精修）迭代数，lr 更低")
+    p.add_argument("--extend2-lr", type=float, default=2e-5,
+                   help="第三阶段的恒定学习率")
+    p.add_argument("--ema-decay", type=float, default=0.0,
+                   help="权重 EMA 衰减系数（0=关闭；如 0.999 表示每迭代平滑 0.1%）")
     p.add_argument("--eval-every", type=int, default=25)
     p.add_argument("--eval-episodes", type=int, default=50)
     p.add_argument("--seed", type=int, default=1)
@@ -208,6 +214,8 @@ def main():
     # CUDA 图路径：fast 环境 + GPU 更新 + minibatch 整除（形状全静态才能捕获）
     use_graph = (args.env == "fast" and device.type == "cuda" and not args.no_graph
                  and (args.n_envs * args.steps) % args.minibatch_size == 0)
+    ema = ({k: v.detach().clone().float() for k, v in model.state_dict().items()}
+           if args.ema_decay > 0 else None)
     critic_opt = (torch.optim.Adam(model.v_net.parameters(), lr=args.critic_lr)
                   if args.afterstate_adv else None)
     if use_graph:
@@ -255,29 +263,35 @@ def main():
     eval_writer = csv.writer(eval_csv)
     eval_writer.writerow(["iter", "steps", "score_mean", "score_std", "max_tile_mean",
                           "board_sum_mean", "board_sum_std", "length_mean",
-                          "p>=128", "p>=256", "p>=512", "p>=1024"])
+                          "p>=128", "p>=256", "p>=512", "p>=1024",
+                          "raw_board_sum", "raw_p512"])
 
     def save_ckpt(name, it):
         torch.save({"it": it, "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(), "args": vars(args)},
                    os.path.join(out_dir, name))
 
+    total_iters_print = args.iters + args.extend_iters + args.extend2_iters
     print(f"[{args.run_name}] device={device} env={args.env} cuda_graph={'on' if use_graph else 'off'}, "
           f"每迭代 {args.n_envs * args.steps} 步, "
-          f"共 {args.iters + args.extend_iters} 迭代 "
-          f"(≈{(args.iters + args.extend_iters) * args.n_envs * args.steps / 1e6:.1f}M 步)"
-          + (f"，其中精修 {args.extend_iters} 迭代 @ lr {args.extend_lr:g}"
-             if args.extend_iters > 0 else ""))
+          f"共 {total_iters_print} 迭代 "
+          f"(≈{total_iters_print * args.n_envs * args.steps / 1e6:.1f}M 步)"
+          + (f"，精修 {args.extend_iters}@{args.extend_lr:g}" if args.extend_iters > 0 else "")
+          + (f"，超精修 {args.extend2_iters}@{args.extend2_lr:g}" if args.extend2_iters > 0 else "")
+          + (f"，EMA decay={args.ema_decay}" if args.ema_decay > 0 else ""))
     t_start = time.time()
-    total_iters = args.iters + args.extend_iters
+    total_iters = args.iters + args.extend_iters + args.extend2_iters
     for it in range(1, total_iters + 1):
-        # 阶段一：标准线性退火；阶段二（精修）：lr 恒定 + 熵固定终值
+        # 阶段一：线性退火；阶段二/三：恒定低 lr 精修（熵固定终值）
         if it <= args.iters:
             frac = (it - 1) / max(args.iters - 1, 1)
             lr_now = args.lr * (1.0 - (1.0 - args.lr_final_ratio) * frac)
             ent_now = args.ent_coef + (args.ent_final - args.ent_coef) * frac
-        else:
+        elif it <= args.iters + args.extend_iters:
             lr_now = args.extend_lr
+            ent_now = args.ent_final
+        else:
+            lr_now = args.extend2_lr
             ent_now = args.ent_final
         for g in optimizer.param_groups:
             g["lr"] = lr_now
@@ -410,6 +424,14 @@ def main():
             rollout_model.eval()
         total_steps = it * args.n_envs * args.steps
 
+        if ema is not None:
+            with torch.no_grad():
+                for k, v in model.state_dict().items():
+                    if v.dtype.is_floating_point:
+                        ema[k].mul_(args.ema_decay).add_(v.float(), alpha=1 - args.ema_decay)
+                    else:
+                        ema[k] = v.detach().clone()
+
         if recent:
             arr = np.array(recent)
             tr = [arr[:, 0].mean(), arr[:, 0].std(), arr[:, 1].mean(),
@@ -434,13 +456,25 @@ def main():
             eval_fn = run_greedy_episodes_fast if args.env == "fast" else run_greedy_episodes
             ev = eval_fn(model, args.eval_episodes, seed=12345, device=device)
             metric = ev["board_sum"][0] + 250.0 * ev["p>=256"][0]  # 综合作业目标选最优
+            use_ema = False
+            raw_sum, raw_p512 = ev['board_sum'][0], ev['p>=512'][0]
+            if ema is not None:
+                raw = {k: v.detach().clone() for k, v in model.state_dict().items()}
+                model.load_state_dict({k: v.to(raw[k].dtype) for k, v in ema.items()})
+                ev_ema = eval_fn(model, args.eval_episodes, seed=12345, device=device)
+                metric_ema = ev_ema["board_sum"][0] + 250.0 * ev_ema["p>=256"][0]
+                if metric_ema > metric:
+                    ev, metric, use_ema = ev_ema, metric_ema, True
+                else:
+                    model.load_state_dict(raw)
             eval_writer.writerow([it, total_steps,
                                   f"{ev['score'][0]:.1f}", f"{ev['score'][1]:.1f}",
                                   f"{ev['max_tile'][0]:.1f}",
                                   f"{ev['board_sum'][0]:.1f}", f"{ev['board_sum'][1]:.1f}",
                                   f"{ev['length'][0]:.1f}",
                                   f"{ev['p>=128'][0]:.3f}", f"{ev['p>=256'][0]:.3f}",
-                                  f"{ev['p>=512'][0]:.3f}", f"{ev['p>=1024'][0]:.3f}"])
+                                  f"{ev['p>=512'][0]:.3f}", f"{ev['p>=1024'][0]:.3f}",
+                                  f"{raw_sum:.1f}", f"{raw_p512:.3f}"])
             eval_csv.flush()
             print(f"  [eval it {it}] score {ev['score'][0]:.0f}±{ev['score'][1]:.0f} | "
                   f"max_tile {ev['max_tile'][0]:.0f} | sum {ev['board_sum'][0]:.0f}±{ev['board_sum'][1]:.0f} | "
@@ -453,6 +487,11 @@ def main():
             save_ckpt("last.pt", it)
             train_csv.flush()
 
+    if ema is not None:
+        raw = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        model.load_state_dict({k: v.to(raw[k].dtype) for k, v in ema.items()})
+        save_ckpt("last_ema.pt", total_iters)
+        model.load_state_dict(raw)
     save_ckpt("last.pt", total_iters)
     train_csv.close()
     eval_csv.close()

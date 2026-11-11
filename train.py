@@ -459,14 +459,14 @@ def main():
             use_ema = False
             raw_sum, raw_p512 = ev['board_sum'][0], ev['p>=512'][0]
             if ema is not None:
-                raw = {k: v.detach().clone() for k, v in model.state_dict().items()}
-                model.load_state_dict({k: v.to(raw[k].dtype) for k, v in ema.items()})
+                raw_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+                model.load_state_dict({k: v.to(raw_state[k].dtype) for k, v in ema.items()})
                 ev_ema = eval_fn(model, args.eval_episodes, seed=12345, device=device)
                 metric_ema = ev_ema["board_sum"][0] + 250.0 * ev_ema["p>=256"][0]
                 if metric_ema > metric:
                     ev, metric, use_ema = ev_ema, metric_ema, True
-                else:
-                    model.load_state_dict(raw)
+                # 关键：无论 EMA 是否更优，训练都必须从原始权重继续
+                model.load_state_dict(raw_state)
             eval_writer.writerow([it, total_steps,
                                   f"{ev['score'][0]:.1f}", f"{ev['score'][1]:.1f}",
                                   f"{ev['max_tile'][0]:.1f}",
@@ -482,7 +482,13 @@ def main():
                   f"p512 {ev['p>=512'][0]:.2f}", flush=True)
             if metric > best_metric:
                 best_metric = metric
-                save_ckpt("best.pt", it)
+                if use_ema:
+                    keep = {k: v.detach().clone() for k, v in model.state_dict().items()}
+                    model.load_state_dict({k: v.to(keep[k].dtype) for k, v in ema.items()})
+                    save_ckpt("best.pt", it)
+                    model.load_state_dict(keep)
+                else:
+                    save_ckpt("best.pt", it)
         if it % 200 == 0:
             save_ckpt("last.pt", it)
             train_csv.flush()

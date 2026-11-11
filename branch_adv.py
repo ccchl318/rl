@@ -24,13 +24,13 @@ def collect_branch_batch(model, cells_list, branch_g, branch_h, device, gamma):
     N = K * branch_g
     env = FastGame2048Batch(N)
     idx = np.arange(N)
-    cells_arr = np.stack(cells_list)
+    cells_arr = np.repeat(np.stack(cells_list), branch_g, axis=0)  # (K*G, 9)
     env.set_states(idx, cells_arr)
 
     obs = torch.from_numpy(env.obs).to(device)
     mask = torch.from_numpy(env.mask).to(device)
     act, logp, v = model.act_and_value(obs, mask)
-    act0, logp0, v0 = act.cpu(), logp.cpu(), v.cpu()
+    obs0, mask0, act0, logp0, v0 = obs.cpu(), mask.cpu(), act.cpu(), logp.cpu(), v.cpu()
 
     R = np.zeros(N, dtype=np.float64)
     disc = np.ones(N, dtype=np.float64)
@@ -43,19 +43,20 @@ def collect_branch_batch(model, cells_list, branch_g, branch_h, device, gamma):
         obs = torch.from_numpy(env.obs).to(device)
         mask = torch.from_numpy(env.mask).to(device)
         act, logp, v = model.act_and_value(obs, mask)
-        act_l_last, logp_l_last, v_l_last = act.cpu(), logp.cpu(), v.cpu()
 
     # bootstrap：仅对存活分支加 V(s_H)（死亡分支的 R 即死亡折扣回报）
-    R += disc * alive * v_l_last.numpy()
+    R += disc * alive * v.cpu().numpy()
 
     Rm = R.reshape(K, branch_g)
     adv = ((Rm - Rm.mean(axis=1, keepdims=True))
            / (Rm.std(axis=1, keepdims=True) + 1e-6)).reshape(-1)
+    adv_t = torch.from_numpy(adv.astype(np.float32))
     return {
         "obs": obs0,
         "mask": mask0,
         "act": act0,
         "logp": logp0,
-        "adv": torch.from_numpy(adv.astype(np.float32)),
-        "ret": (adv.float() + v0),
+        "val": v0,
+        "adv": adv_t,
+        "ret": adv_t + v0,
     }

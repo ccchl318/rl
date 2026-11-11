@@ -146,19 +146,17 @@ def extend_with_branch(model, buffer, args, flat, n_total_rows):
     cells = obs_all.view(T * N, 9, 16).argmax(dim=-1)
     maxlv = cells.max(dim=1).values
     occ = (cells > 0).sum(dim=1)
-    cand = ((maxlv >= 8) & (occ >= 7)).nonzero(as_tuple=True)[0]
+    key = maxlv * 100 + occ  # 优先高等级，其次更满的棋盘；任何状态做组内对比均合法
+    order = torch.argsort(key, descending=True)
     dev = flat["obs"].device
-    if len(cand) == 0:
-        n = flat["obs"].shape[0]
-        pad = torch.arange(target, device=dev) % n
-        return {k: v[pad].to(dev) for k, v in flat.items()}
-    if len(cand) >= args.branch_k:
-        pick = cand[torch.randperm(len(cand), device=cand.device)[:args.branch_k]]
+    if len(order) >= args.branch_k:
+        pick = order[:args.branch_k]
     else:
-        pick = cand[torch.randint(0, len(cand), (args.branch_k,), device=cand.device)]
+        pick = order[torch.randint(0, len(order), (args.branch_k,), device=cand.device)]
     cells_list = cells[pick].cpu().numpy()
+    model_dev = str(next(model.parameters()).device)
     extra = collect_branch_batch(model, cells_list, args.branch_g, args.branch_h,
-                                 str(obs_all.device), args.gamma)
+                                 model_dev, args.gamma)
     head = {k: v.to(dev) for k, v in flat.items()}
     return {k: torch.cat([head[k], extra[k].to(dev)], dim=0) for k in head}
 

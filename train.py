@@ -54,7 +54,7 @@ def parse_args():
     p.add_argument("--shaping", choices=["none", "bonus512", "potential"], default="none",
                    help="奖励塑形：bonus512=首次合成512给额外奖励；potential=max_tile等级势函数塑形")
     p.add_argument("--bonus512", type=float, default=200.0, help="bonus512 模式的额外奖励幅度")
-    p.add_argument("--phi-w", type=float, default=3.0, help="potential 模式的势函数权重")
+    p.add_argument("--phi-w", type=float, default=1.0, help="potential 模式的势函数权重")
     p.add_argument("--no-mask", action="store_true", help="消融：不使用动作掩码")
     p.add_argument("--env", choices=["fast", "py"], default="fast",
                    help="fast=向量化查表环境（默认）；py=旧逐环境实现（完全复现旧行为）")
@@ -98,16 +98,35 @@ class RolloutBuffer:
         }
 
 
-def apply_shaping(rew, pre_level, post_level, done, args):
+def _phi_dense(cells):
+    """稠密结构势函数（每步都变化）：空格数、最大等级、单调性、平滑度。
+
+    特征与 expectimax 启发式同族（系数即其搜索评估权重），量级 ~0-30。
+    """
+    empty = (cells == 0).sum(axis=1).astype(np.float64)
+    logs = cells.astype(np.float64)
+    grid = logs.reshape(-1, 3, 3)
+    dh = (grid[:, :, 1:] - grid[:, :, :-1]).reshape(len(logs), -1)
+    dv = (grid[:, 1:, :] - grid[:, :-1, :]).reshape(len(logs), -1)
+    inc = np.maximum(dh, 0).sum(1) + np.maximum(dv, 0).sum(1)
+    dec = np.maximum(-dh, 0).sum(1) + np.maximum(-dv, 0).sum(1)
+    mono = -np.minimum(inc, dec)
+    smooth = -(np.abs(dh).sum(1) + np.abs(dv).sum(1))
+    return 2.7 * np.log(empty + 1.0) + logs.max(axis=1) + 1.0 * mono + 0.1 * smooth
+
+
+def apply_shaping(rew, pre_cells, post_cells, done, args):
     """在本步奖励上叠加塑形项（仅对未结束的对局生效）。
 
-    potential: F = w * (log2(max_tile_post) - log2(max_tile_pre))，Ng et al. 1999
-    势函数形式，理论上不改变最优策略；bonus512: 首次合成 512 给额外奖励。
+    potential: F = gamma * phi(s') - phi(s)（Ng et al. 1999 势函数形式，
+    理论上不改变最优策略）；phi 为稠密结构势，每步都变化，把远期大奖励
+    的信用提前分摊到每一步，绕开 GAE 的 (gamma*lam)^k 信用衰减。
+    bonus512: 首次合成 512 给额外奖励（稀疏对照）。
     """
     alive = done == 0
     if args.shaping == "potential":
-        return rew + args.phi_w * (post_level - pre_level) * alive
-    return rew + ((post_level >= 9) & (pre_level < 9)) * alive * args.bonus512
+        return rew + args.phi_w * (args.gamma * _phi_dense(post_cells) - _phi_dense(pre_cells)) * alive
+    return rew + ((post_cells.max(axis=1) >= 9) & (pre_cells.max(axis=1) < 9)) * alive * args.bonus512
 
 
 def main():
@@ -210,10 +229,10 @@ def main():
                     buffer.act[t] = torch.from_numpy(act)
                     buffer.logp[t] = torch.from_numpy(logp)
                     buffer.val[t] = torch.from_numpy(vals)
-                    pre = benv.cells.max(axis=1) if args.shaping != "none" else None
+                    pre = benv.cells.copy() if args.shaping != "none" else None
                     rew, done = benv.step(act)
                     if args.shaping != "none":
-                        rew = apply_shaping(rew, pre, benv.cells.max(axis=1), done, args)
+                        rew = apply_shaping(rew, pre, benv.cells, done, args)
                     buffer.rew[t] = rew
                     buffer.done[t] = done
                     for _, stat in benv.pop_finished():
@@ -232,10 +251,10 @@ def main():
                     buffer.act[t] = act.to(device)
                     buffer.logp[t] = logp.to(device)
                     buffer.val[t] = vals.to(device)
-                    pre = benv.cells.max(axis=1) if args.shaping != "none" else None
+                    pre = benv.cells.copy() if args.shaping != "none" else None
                     rew, done = benv.step(act.cpu().numpy())
                     if args.shaping != "none":
-                        rew = apply_shaping(rew, pre, benv.cells.max(axis=1), done, args)
+                        rew = apply_shaping(rew, pre, benv.cells, done, args)
                     buffer.rew[t] = rew
                     buffer.done[t] = done
                     for _, stat in benv.pop_finished():

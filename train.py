@@ -29,6 +29,7 @@ import torch
 from game2048_env import Game2048Env3x3, ACTION_MEANING
 from game2048_env_fast import FastGame2048Batch
 from branch_adv import collect_branch_batch
+from afterstate import model_advantages, train_critic
 from gpu_graph import GraphedPolicy, GraphedUpdater
 from ppo import (ActorCritic, compute_gae, ppo_update, run_greedy_episodes,
                  run_greedy_episodes_fast)
@@ -62,6 +63,10 @@ def parse_args():
     p.add_argument("--branch-h", type=int, default=32, help="分支续局步数 H")
     p.add_argument("--branch-start-iter", type=int, default=0,
                    help="分支采样从该迭代才激活（前期纯基线 PPO；0=立即激活）")
+    p.add_argument("--afterstate-adv", action="store_true",
+                   help="afterstate critic + 模型精确优势（PPO 的 model-based 变体）")
+    p.add_argument("--critic-epochs", type=int, default=3,
+                   help="afterstate critic 每迭代的回归轮数")
     p.add_argument("--no-mask", action="store_true", help="消融：不使用动作掩码")
     p.add_argument("--env", choices=["fast", "py"], default="fast",
                    help="fast=向量化查表环境（默认）；py=旧逐环境实现（完全复现旧行为）")
@@ -191,19 +196,22 @@ def main():
     # CUDA 图路径：fast 环境 + GPU 更新 + minibatch 整除（形状全静态才能捕获）
     use_graph = (args.env == "fast" and device.type == "cuda" and not args.no_graph
                  and (args.n_envs * args.steps) % args.minibatch_size == 0)
+    critic_opt = (torch.optim.Adam(model.v_net.parameters(), lr=args.lr)
+                  if args.afterstate_adv else None)
     if use_graph:
         # fused Adam：图外每次 minibatch 一次融合 kernel；lr 退火仍然每迭代生效
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, fused=True)
         buffer_device = torch.device("cpu")  # rollout 期间 buffer 常驻 CPU，迭代末一次 H2D
         roller = GraphedPolicy(model, args.n_envs, device, seed=args.seed + 1)
+        vf_coef_now = 0.0 if args.afterstate_adv else args.vf_coef
         updater = GraphedUpdater(model, optimizer, args.n_envs * args.steps,
-                                 args.minibatch_size, args.vf_coef, args.clip,
+                                 args.minibatch_size, vf_coef_now, args.clip,
                                  device, epochs=args.epochs)
         branch_updater = None
         if args.branch_k > 0:
             assert (args.branch_k * args.branch_g) % args.minibatch_size == 0,                 "分支行数必须被 minibatch 整除"
             branch_updater = GraphedUpdater(model, optimizer, args.branch_k * args.branch_g,
-                                            args.minibatch_size, args.vf_coef, args.clip,
+                                            args.minibatch_size, vf_coef_now, args.clip,
                                             device, epochs=args.epochs)
         mask_all = np.ones((args.n_envs, 4), dtype=bool)  # --no-mask 用的全真掩码
         rollout_model = None
@@ -328,17 +336,23 @@ def main():
                         mask_list[i] = env.action_mask()
                     total_steps += args.n_envs
 
-        # bootstrap 末端价值
-        with torch.no_grad():
-            if use_graph:
-                last_values = roller.value_only(benv.obs)
-            else:
-                obs_final = torch.from_numpy(benv.obs) if args.env == "fast" \
-                    else torch.from_numpy(np.stack(obs_list))
-                last_values = model.value(obs_final.to(device)).cpu().numpy()
-        adv, ret = compute_gae(buffer.rew, buffer.val.cpu().numpy(), buffer.done,
-                               last_values, args.gamma, args.lam)
-
+        if args.afterstate_adv:
+            adv, ret, aft_obs, w_target = model_advantages(
+                model, buffer, args, device, benv.cells)
+            critic_loss = train_critic(model, critic_opt, aft_obs, w_target,
+                                       args.critic_epochs, args.minibatch_size, device)
+        else:
+            # bootstrap 末端价值
+            with torch.no_grad():
+                if use_graph:
+                    last_values = roller.value_only(benv.obs)
+                else:
+                    obs_final = torch.from_numpy(benv.obs) if args.env == "fast" \
+                        else torch.from_numpy(np.stack(obs_list))
+                    last_values = model.value(obs_final.to(device)).cpu().numpy()
+            adv, ret = compute_gae(buffer.rew, buffer.val.cpu().numpy(), buffer.done,
+                                   last_values, args.gamma, args.lam)
+    
         model.train()
         if use_graph:
             # 图重放更新：gather->loss->backward 在图内，clip+fused Adam 在图外；
@@ -346,7 +360,8 @@ def main():
             stats = updater.update(buffer.flat(adv, ret), ent_now)
         else:
             stats = ppo_update(model, optimizer, buffer.flat(adv, ret), args.clip,
-                               args.epochs, args.minibatch_size, args.vf_coef, ent_now)
+                               args.epochs, args.minibatch_size,
+                               0.0 if args.afterstate_adv else args.vf_coef, ent_now)
         if args.branch_k > 0 and it >= args.branch_start_iter:
             bflat = collect_branch_states(model, buffer, args, str(device))
             if bflat is not None:
@@ -355,7 +370,7 @@ def main():
                 else:
                     bstats = ppo_update(model, optimizer, bflat, args.clip,
                                         max(2, args.epochs // 2), args.minibatch_size,
-                                        args.vf_coef, ent_now)
+                                        0.0 if args.afterstate_adv else args.vf_coef, ent_now)
         if rollout_model is not None:
             rollout_model.load_state_dict(model.state_dict())
             rollout_model.eval()

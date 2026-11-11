@@ -91,7 +91,13 @@ def parse_args():
     p.add_argument("--extend2-lr", type=float, default=2e-5,
                    help="第三阶段的恒定学习率")
     p.add_argument("--ema-decay", type=float, default=0.0,
-                   help="权重 EMA 衰减系数（0=关闭；如 0.999 表示每迭代平滑 0.1%）")
+                   help="权重 EMA 衰减系数（0=关闭）")
+    p.add_argument("--ema-decays", type=str, default="",
+                   help="多 EMA 衰减系数，逗号分隔（如 0.999,0.9995）；同时维护多个并取最优")
+    p.add_argument("--extend3-iters", type=int, default=0,
+                   help="第四阶段（更低 lr）迭代数")
+    p.add_argument("--extend3-lr", type=float, default=5e-6,
+                   help="第四阶段恒定学习率")
     p.add_argument("--eval-every", type=int, default=25)
     p.add_argument("--eval-episodes", type=int, default=50)
     p.add_argument("--seed", type=int, default=1)
@@ -214,8 +220,11 @@ def main():
     # CUDA 图路径：fast 环境 + GPU 更新 + minibatch 整除（形状全静态才能捕获）
     use_graph = (args.env == "fast" and device.type == "cuda" and not args.no_graph
                  and (args.n_envs * args.steps) % args.minibatch_size == 0)
-    ema = ({k: v.detach().clone().float() for k, v in model.state_dict().items()}
-           if args.ema_decay > 0 else None)
+    ema_decs = ([float(x) for x in args.ema_decays.split(',') if x.strip()]
+                if args.ema_decays.strip() else
+                ([args.ema_decay] if args.ema_decay > 0 else []))
+    emas = {d: {k: v.detach().clone().float() for k, v in model.state_dict().items()}
+            for d in ema_decs}
     critic_opt = (torch.optim.Adam(model.v_net.parameters(), lr=args.critic_lr)
                   if args.afterstate_adv else None)
     if use_graph:
@@ -271,16 +280,16 @@ def main():
                     "optimizer": optimizer.state_dict(), "args": vars(args)},
                    os.path.join(out_dir, name))
 
-    total_iters_print = args.iters + args.extend_iters + args.extend2_iters
+    total_iters_print = args.iters + args.extend_iters + args.extend2_iters + args.extend3_iters
     print(f"[{args.run_name}] device={device} env={args.env} cuda_graph={'on' if use_graph else 'off'}, "
           f"每迭代 {args.n_envs * args.steps} 步, "
           f"共 {total_iters_print} 迭代 "
           f"(≈{total_iters_print * args.n_envs * args.steps / 1e6:.1f}M 步)"
           + (f"，精修 {args.extend_iters}@{args.extend_lr:g}" if args.extend_iters > 0 else "")
           + (f"，超精修 {args.extend2_iters}@{args.extend2_lr:g}" if args.extend2_iters > 0 else "")
-          + (f"，EMA decay={args.ema_decay}" if args.ema_decay > 0 else ""))
+          + (f"，EMA={args.ema_decays or args.ema_decay}" if (args.ema_decays or args.ema_decay > 0) else ""))
     t_start = time.time()
-    total_iters = args.iters + args.extend_iters + args.extend2_iters
+    total_iters = args.iters + args.extend_iters + args.extend2_iters + args.extend3_iters
     for it in range(1, total_iters + 1):
         # 阶段一：线性退火；阶段二/三：恒定低 lr 精修（熵固定终值）
         if it <= args.iters:
@@ -290,8 +299,11 @@ def main():
         elif it <= args.iters + args.extend_iters:
             lr_now = args.extend_lr
             ent_now = args.ent_final
-        else:
+        elif it <= args.iters + args.extend_iters + args.extend2_iters:
             lr_now = args.extend2_lr
+            ent_now = args.ent_final
+        else:
+            lr_now = args.extend3_lr
             ent_now = args.ent_final
         for g in optimizer.param_groups:
             g["lr"] = lr_now
@@ -424,13 +436,15 @@ def main():
             rollout_model.eval()
         total_steps = it * args.n_envs * args.steps
 
-        if ema is not None:
+        if emas:
             with torch.no_grad():
-                for k, v in model.state_dict().items():
-                    if v.dtype.is_floating_point:
-                        ema[k].mul_(args.ema_decay).add_(v.float(), alpha=1 - args.ema_decay)
-                    else:
-                        ema[k] = v.detach().clone()
+                cur = model.state_dict()
+                for d, st in emas.items():
+                    for k, v in cur.items():
+                        if v.dtype.is_floating_point:
+                            st[k].mul_(d).add_(v.float(), alpha=1 - d)
+                        else:
+                            st[k] = v.detach().clone()
 
         if recent:
             arr = np.array(recent)
@@ -456,16 +470,17 @@ def main():
             eval_fn = run_greedy_episodes_fast if args.env == "fast" else run_greedy_episodes
             ev = eval_fn(model, args.eval_episodes, seed=12345, device=device)
             metric = ev["board_sum"][0] + 250.0 * ev["p>=256"][0]  # 综合作业目标选最优
-            use_ema = False
+            best_ema_dec = None
             raw_sum, raw_p512 = ev['board_sum'][0], ev['p>=512'][0]
-            if ema is not None:
+            if emas:
                 raw_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-                model.load_state_dict({k: v.to(raw_state[k].dtype) for k, v in ema.items()})
-                ev_ema = eval_fn(model, args.eval_episodes, seed=12345, device=device)
-                metric_ema = ev_ema["board_sum"][0] + 250.0 * ev_ema["p>=256"][0]
-                if metric_ema > metric:
-                    ev, metric, use_ema = ev_ema, metric_ema, True
-                # 关键：无论 EMA 是否更优，训练都必须从原始权重继续
+                for d, st in emas.items():
+                    model.load_state_dict({k: v.to(raw_state[k].dtype) for k, v in st.items()})
+                    ev_d = eval_fn(model, args.eval_episodes, seed=12345, device=device)
+                    m_d = ev_d["board_sum"][0] + 250.0 * ev_d["p>=256"][0]
+                    if m_d > metric:
+                        ev, metric, best_ema_dec = ev_d, m_d, d
+                # 无论哪个 EMA 更优，训练都必须从原始权重继续
                 model.load_state_dict(raw_state)
             eval_writer.writerow([it, total_steps,
                                   f"{ev['score'][0]:.1f}", f"{ev['score'][1]:.1f}",
@@ -482,9 +497,10 @@ def main():
                   f"p512 {ev['p>=512'][0]:.2f}", flush=True)
             if metric > best_metric:
                 best_metric = metric
-                if use_ema:
+                if best_ema_dec is not None:
                     keep = {k: v.detach().clone() for k, v in model.state_dict().items()}
-                    model.load_state_dict({k: v.to(keep[k].dtype) for k, v in ema.items()})
+                    st = emas[best_ema_dec]
+                    model.load_state_dict({k: v.to(keep[k].dtype) for k, v in st.items()})
                     save_ckpt("best.pt", it)
                     model.load_state_dict(keep)
                 else:
@@ -493,10 +509,11 @@ def main():
             save_ckpt("last.pt", it)
             train_csv.flush()
 
-    if ema is not None:
+    if emas:
         raw = {k: v.detach().clone() for k, v in model.state_dict().items()}
-        model.load_state_dict({k: v.to(raw[k].dtype) for k, v in ema.items()})
-        save_ckpt("last_ema.pt", total_iters)
+        for d, st in emas.items():
+            model.load_state_dict({k: v.to(raw[k].dtype) for k, v in st.items()})
+            save_ckpt(f"last_ema_{d:g}.pt", total_iters)
         model.load_state_dict(raw)
     save_ckpt("last.pt", total_iters)
     train_csv.close()

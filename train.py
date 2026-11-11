@@ -82,6 +82,10 @@ def parse_args():
                    help="rollout 推理设备（仅 --no-graph 或 CPU 训练时生效；默认 CUDA 图路径下推理在 GPU 重放）")
     p.add_argument("--no-graph", action="store_true",
                    help="禁用 CUDA Graph（推理图+更新图），退回逐算子执行")
+    p.add_argument("--extend-iters", type=int, default=0,
+                   help="主调度结束后的精修迭代数（lr 恒定 --extend-lr，熵固定在终值）")
+    p.add_argument("--extend-lr", type=float, default=6e-5,
+                   help="精修阶段的恒定学习率")
     p.add_argument("--eval-every", type=int, default=25)
     p.add_argument("--eval-episodes", type=int, default=50)
     p.add_argument("--seed", type=int, default=1)
@@ -260,13 +264,21 @@ def main():
 
     print(f"[{args.run_name}] device={device} env={args.env} cuda_graph={'on' if use_graph else 'off'}, "
           f"每迭代 {args.n_envs * args.steps} 步, "
-          f"共 {args.iters} 迭代 (≈{args.iters * args.n_envs * args.steps / 1e6:.1f}M 步)")
+          f"共 {args.iters + args.extend_iters} 迭代 "
+          f"(≈{(args.iters + args.extend_iters) * args.n_envs * args.steps / 1e6:.1f}M 步)"
+          + (f"，其中精修 {args.extend_iters} 迭代 @ lr {args.extend_lr:g}"
+             if args.extend_iters > 0 else ""))
     t_start = time.time()
-    for it in range(1, args.iters + 1):
-        # lr 与熵系数线性退火
-        frac = (it - 1) / max(args.iters - 1, 1)
-        lr_now = args.lr * (1.0 - (1.0 - args.lr_final_ratio) * frac)
-        ent_now = args.ent_coef + (args.ent_final - args.ent_coef) * frac
+    total_iters = args.iters + args.extend_iters
+    for it in range(1, total_iters + 1):
+        # 阶段一：标准线性退火；阶段二（精修）：lr 恒定 + 熵固定终值
+        if it <= args.iters:
+            frac = (it - 1) / max(args.iters - 1, 1)
+            lr_now = args.lr * (1.0 - (1.0 - args.lr_final_ratio) * frac)
+            ent_now = args.ent_coef + (args.ent_final - args.ent_coef) * frac
+        else:
+            lr_now = args.extend_lr
+            ent_now = args.ent_final
         for g in optimizer.param_groups:
             g["lr"] = lr_now
 
@@ -418,7 +430,7 @@ def main():
                   f"kl {stats['kl']:.3f} | v_l {stats['v_loss']:.1f}", flush=True)
 
         # 周期性贪心评估（固定种子保证各次评估可比；fast 批量评估与串行逐局等价）
-        if it % args.eval_every == 0 or it == args.iters:
+        if it % args.eval_every == 0 or it == total_iters:
             eval_fn = run_greedy_episodes_fast if args.env == "fast" else run_greedy_episodes
             ev = eval_fn(model, args.eval_episodes, seed=12345, device=device)
             metric = ev["board_sum"][0] + 250.0 * ev["p>=256"][0]  # 综合作业目标选最优
@@ -441,7 +453,7 @@ def main():
             save_ckpt("last.pt", it)
             train_csv.flush()
 
-    save_ckpt("last.pt", args.iters)
+    save_ckpt("last.pt", total_iters)
     train_csv.close()
     eval_csv.close()
     print(f"训练完成，用时 {(time.time() - t_start) / 60:.1f} 分钟，结果目录: {out_dir}")

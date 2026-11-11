@@ -60,6 +60,8 @@ def parse_args():
                    help="状态级 GRPO：每迭代采样的拥挤状态数 K（0=关闭）")
     p.add_argument("--branch-g", type=int, default=8, help="每状态的分支数 G")
     p.add_argument("--branch-h", type=int, default=32, help="分支续局步数 H")
+    p.add_argument("--branch-start-iter", type=int, default=0,
+                   help="分支采样从该迭代才激活（前期纯基线 PPO；0=立即激活）")
     p.add_argument("--no-mask", action="store_true", help="消融：不使用动作掩码")
     p.add_argument("--env", choices=["fast", "py"], default="fast",
                    help="fast=向量化查表环境（默认）；py=旧逐环境实现（完全复现旧行为）")
@@ -134,31 +136,28 @@ def apply_shaping(rew, pre_cells, post_cells, done, args):
     return rew + ((post_cells.max(axis=1) >= 9) & (pre_cells.max(axis=1) < 9)) * alive * args.bonus512
 
 
-def extend_with_branch(model, buffer, args, flat, n_total_rows):
-    """状态级 GRPO：从 buffer 选拥挤状态（含 256 且占用>=7）做分支采样，
-    生成组内相对优势的首动作转移，拼接在主 GAE 批次之后。
-
-    候选不足时（训练初期棋盘还没长出 256）退化为重复主批次行 padding，
-    保持 CUDA Graph 静态形状；候选为零时无塑形梯度，等价纯 PPO。"""
-    target = n_total_rows
+def collect_branch_states(model, buffer, args, device):
+    """状态级 GRPO：优先选含 256 的拥挤状态（不足则按 等级*100+占用 降级挑选），
+    分支采样生成组内相对优势的首动作转移；无候选时返回 None。"""
     obs_all = buffer.obs
     T, N = obs_all.shape[:2]
     cells = obs_all.view(T * N, 9, 16).argmax(dim=-1)
     maxlv = cells.max(dim=1).values
     occ = (cells > 0).sum(dim=1)
-    key = maxlv * 100 + occ  # 优先高等级，其次更满的棋盘；任何状态做组内对比均合法
-    order = torch.argsort(key, descending=True)
-    dev = flat["obs"].device
-    if len(order) >= args.branch_k:
-        pick = order[:args.branch_k]
+    strict = ((maxlv >= 8) & (occ >= 7)).nonzero(as_tuple=True)[0]
+    if len(strict) >= args.branch_k:
+        pick = strict[torch.randperm(len(strict), device=strict.device)[:args.branch_k]]
     else:
-        pick = order[torch.randint(0, len(order), (args.branch_k,), device=cand.device)]
+        key = maxlv * 100 + occ
+        order = torch.argsort(key, descending=True)
+        if len(order) >= args.branch_k:
+            pick = order[:args.branch_k]
+        else:
+            pick = order[torch.randint(0, len(order), (args.branch_k,), device=order.device)]
     cells_list = cells[pick].cpu().numpy()
     model_dev = str(next(model.parameters()).device)
-    extra = collect_branch_batch(model, cells_list, args.branch_g, args.branch_h,
-                                 model_dev, args.gamma)
-    head = {k: v.to(dev) for k, v in flat.items()}
-    return {k: torch.cat([head[k], extra[k].to(dev)], dim=0) for k in head}
+    return collect_branch_batch(model, cells_list, args.branch_g, args.branch_h,
+                                model_dev, args.gamma)
 
 
 def main():
@@ -190,18 +189,22 @@ def main():
         print(f"[{args.run_name}] 从 {args.init_from} 载入模型权重 (来源 it={sd.get('it')})，"
               f"优化器与调度全新开始", flush=True)
     # CUDA 图路径：fast 环境 + GPU 更新 + minibatch 整除（形状全静态才能捕获）
-    branch_rows = args.branch_k * args.branch_g if args.branch_k > 0 else 0
-    n_total_rows = args.n_envs * args.steps + branch_rows
     use_graph = (args.env == "fast" and device.type == "cuda" and not args.no_graph
-                 and n_total_rows % args.minibatch_size == 0)
+                 and (args.n_envs * args.steps) % args.minibatch_size == 0)
     if use_graph:
         # fused Adam：图外每次 minibatch 一次融合 kernel；lr 退火仍然每迭代生效
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, fused=True)
         buffer_device = torch.device("cpu")  # rollout 期间 buffer 常驻 CPU，迭代末一次 H2D
         roller = GraphedPolicy(model, args.n_envs, device, seed=args.seed + 1)
-        updater = GraphedUpdater(model, optimizer, n_total_rows,
+        updater = GraphedUpdater(model, optimizer, args.n_envs * args.steps,
                                  args.minibatch_size, args.vf_coef, args.clip,
                                  device, epochs=args.epochs)
+        branch_updater = None
+        if args.branch_k > 0:
+            assert (args.branch_k * args.branch_g) % args.minibatch_size == 0,                 "分支行数必须被 minibatch 整除"
+            branch_updater = GraphedUpdater(model, optimizer, args.branch_k * args.branch_g,
+                                            args.minibatch_size, args.vf_coef, args.clip,
+                                            device, epochs=args.epochs)
         mask_all = np.ones((args.n_envs, 4), dtype=bool)  # --no-mask 用的全真掩码
         rollout_model = None
     else:
@@ -336,18 +339,23 @@ def main():
         adv, ret = compute_gae(buffer.rew, buffer.val.cpu().numpy(), buffer.done,
                                last_values, args.gamma, args.lam)
 
-        flat = buffer.flat(adv, ret)
-        if args.branch_k > 0:
-            flat = extend_with_branch(model, buffer, args, flat, n_total_rows)
-
         model.train()
         if use_graph:
             # 图重放更新：gather->loss->backward 在图内，clip+fused Adam 在图外；
             # batch 仍在 CPU，update() 内部做每迭代一次的集中 H2D
-            stats = updater.update(flat, ent_now)
+            stats = updater.update(buffer.flat(adv, ret), ent_now)
         else:
-            stats = ppo_update(model, optimizer, flat, args.clip,
+            stats = ppo_update(model, optimizer, buffer.flat(adv, ret), args.clip,
                                args.epochs, args.minibatch_size, args.vf_coef, ent_now)
+        if args.branch_k > 0 and it >= args.branch_start_iter:
+            bflat = collect_branch_states(model, buffer, args, str(device))
+            if bflat is not None:
+                if use_graph:
+                    bstats = branch_updater.update(bflat, ent_now)
+                else:
+                    bstats = ppo_update(model, optimizer, bflat, args.clip,
+                                        max(2, args.epochs // 2), args.minibatch_size,
+                                        args.vf_coef, ent_now)
         if rollout_model is not None:
             rollout_model.load_state_dict(model.state_dict())
             rollout_model.eval()

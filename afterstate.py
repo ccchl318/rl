@@ -107,11 +107,17 @@ def model_advantages(model, buffer, args, device, last_cells):
                      torch.full_like(w4, -1.0 * scale) + args.gamma * w_state[:, None])
     v_pi = (probs * q4).sum(-1)
     q_taken = rew + args.gamma * w_after
-    adv = (q_taken - v_pi).cpu().numpy()
+    adv_model = (q_taken - v_pi)
+    # 标准化到与 PPO 采样优势同尺度（确定性优势方向一致，需软缩放）
+    adv_model = (adv_model - adv_model.mean()) / (adv_model.std() + 1e-8)
+    adv = (adv_model * args.adv_scale).cpu().numpy()
 
     # 批评家目标：W(s'_t) ← r_t + gamma*W(s'_{t+1})，终局不 bootstrap
     next_w = torch.empty(M, device=dev)
     next_w[:-N] = w_after[N:]
     next_w[-N:] = w_last
     w_target = rew + args.gamma * next_w * (1.0 - done)
-    return adv, q_taken.cpu().numpy(), aft_obs, w_target
+    # 目标裁剪：防止自举发散（v_loss 爆炸的直接原因）
+    w_clip = args.critic_target_clip
+    w_target = w_after.detach() + (w_target - w_after.detach()).clamp(-w_clip, w_clip)
+    return adv, q_taken.cpu().numpy(), aft_obs, w_target.detach()

@@ -67,6 +67,14 @@ def parse_args():
                    help="afterstate critic + 模型精确优势（PPO 的 model-based 变体）")
     p.add_argument("--critic-epochs", type=int, default=3,
                    help="afterstate critic 每迭代的回归轮数")
+    p.add_argument("--critic-lr", type=float, default=6.25e-5,
+                   help="afterstate critic 独立学习率（默认 0.1x 主 lr）")
+    p.add_argument("--critic-target-clip", type=float, default=5.0,
+                   help="critic TD 目标相对当前预估的裁剪幅度")
+    p.add_argument("--adv-scale", type=float, default=1.0,
+                   help="模型优势缩放")
+    p.add_argument("--adv-mix", type=float, default=0.5,
+                   help="模型优势的混合权重（1=纯模型优势，0=纯 GAE）")
     p.add_argument("--no-mask", action="store_true", help="消融：不使用动作掩码")
     p.add_argument("--env", choices=["fast", "py"], default="fast",
                    help="fast=向量化查表环境（默认）；py=旧逐环境实现（完全复现旧行为）")
@@ -196,7 +204,7 @@ def main():
     # CUDA 图路径：fast 环境 + GPU 更新 + minibatch 整除（形状全静态才能捕获）
     use_graph = (args.env == "fast" and device.type == "cuda" and not args.no_graph
                  and (args.n_envs * args.steps) % args.minibatch_size == 0)
-    critic_opt = (torch.optim.Adam(model.v_net.parameters(), lr=args.lr)
+    critic_opt = (torch.optim.Adam(model.v_net.parameters(), lr=args.critic_lr)
                   if args.afterstate_adv else None)
     if use_graph:
         # fused Adam：图外每次 minibatch 一次融合 kernel；lr 退火仍然每迭代生效
@@ -337,8 +345,22 @@ def main():
                     total_steps += args.n_envs
 
         if args.afterstate_adv:
-            adv, ret, aft_obs, w_target = model_advantages(
+            adv_m, ret, aft_obs, w_target = model_advantages(
                 model, buffer, args, device, benv.cells)
+            # 与 GAE 按 adv-mix 折中：模型优势零 spawn 噪声但缺采样抖动，
+            # 纯用它会使策略过快确定性化（entropy collapse）。折中兼顾两者。
+            with torch.no_grad():
+                if use_graph:
+                    last_values = roller.value_only(benv.obs)
+                else:
+                    last_values = model.value(
+                        torch.from_numpy(benv.obs).to(device)).cpu().numpy()
+            adv_g, _ = compute_gae(buffer.rew, buffer.val.cpu().numpy(), buffer.done,
+                                   last_values, args.gamma, args.lam)
+            adv_g = adv_g.reshape(-1)
+            sg = (adv_g - adv_g.mean()) / (adv_g.std() + 1e-8)
+            sm = (adv_m - adv_m.mean()) / (adv_m.std() + 1e-8)
+            adv = args.adv_mix * sm + (1.0 - args.adv_mix) * sg
             critic_loss = train_critic(model, critic_opt, aft_obs, w_target,
                                        args.critic_epochs, args.minibatch_size, device)
         else:

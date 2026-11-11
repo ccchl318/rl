@@ -51,6 +51,10 @@ def parse_args():
     p.add_argument("--ent-coef", type=float, default=0.02, help="熵系数初始值（线性退火）")
     p.add_argument("--ent-final", type=float, default=0.002, help="熵系数终值")
     p.add_argument("--reward-scale", type=float, default=0.25, help="奖励 = 合并得分 * reward_scale")
+    p.add_argument("--shaping", choices=["none", "bonus512", "potential"], default="none",
+                   help="奖励塑形：bonus512=首次合成512给额外奖励；potential=max_tile等级势函数塑形")
+    p.add_argument("--bonus512", type=float, default=200.0, help="bonus512 模式的额外奖励幅度")
+    p.add_argument("--phi-w", type=float, default=3.0, help="potential 模式的势函数权重")
     p.add_argument("--no-mask", action="store_true", help="消融：不使用动作掩码")
     p.add_argument("--env", choices=["fast", "py"], default="fast",
                    help="fast=向量化查表环境（默认）；py=旧逐环境实现（完全复现旧行为）")
@@ -92,6 +96,18 @@ class RolloutBuffer:
             "adv": torch.from_numpy(adv.reshape(-1)).to(self.obs.device),
             "ret": torch.from_numpy(ret.reshape(-1)).to(self.obs.device),
         }
+
+
+def apply_shaping(rew, pre_level, post_level, done, args):
+    """在本步奖励上叠加塑形项（仅对未结束的对局生效）。
+
+    potential: F = w * (log2(max_tile_post) - log2(max_tile_pre))，Ng et al. 1999
+    势函数形式，理论上不改变最优策略；bonus512: 首次合成 512 给额外奖励。
+    """
+    alive = done == 0
+    if args.shaping == "potential":
+        return rew + args.phi_w * (post_level - pre_level) * alive
+    return rew + ((post_level >= 9) & (pre_level < 9)) * alive * args.bonus512
 
 
 def main():
@@ -194,7 +210,10 @@ def main():
                     buffer.act[t] = torch.from_numpy(act)
                     buffer.logp[t] = torch.from_numpy(logp)
                     buffer.val[t] = torch.from_numpy(vals)
+                    pre = benv.cells.max(axis=1) if args.shaping != "none" else None
                     rew, done = benv.step(act)
+                    if args.shaping != "none":
+                        rew = apply_shaping(rew, pre, benv.cells.max(axis=1), done, args)
                     buffer.rew[t] = rew
                     buffer.done[t] = done
                     for _, stat in benv.pop_finished():
@@ -213,7 +232,10 @@ def main():
                     buffer.act[t] = act.to(device)
                     buffer.logp[t] = logp.to(device)
                     buffer.val[t] = vals.to(device)
+                    pre = benv.cells.max(axis=1) if args.shaping != "none" else None
                     rew, done = benv.step(act.cpu().numpy())
+                    if args.shaping != "none":
+                        rew = apply_shaping(rew, pre, benv.cells.max(axis=1), done, args)
                     buffer.rew[t] = rew
                     buffer.done[t] = done
                     for _, stat in benv.pop_finished():

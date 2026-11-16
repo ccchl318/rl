@@ -1,0 +1,11 @@
+{
+ "tag": "ultrafine_s2",
+ "hidden": 256,
+ "best_iter": 17000,
+ "board_sum_mean": 768.596,
+ "board_sum_std": 227.64227371909638,
+ "score_mean": 5165.608,
+ "p>=256": 0.977,
+ "p>=512": 0.692,
+ "p>=1024": 0.009
+}

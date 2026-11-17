@@ -116,3 +116,30 @@ data/
 | 10,000 局大样本复核 | eval/validation_10k/*.csv（每模型一个文件）|
 | 课件结论与数据的对应关系 | 本文件第一节的表格 |
 | 完整实验报告 | 仓库根目录 BEST_CONFIG.md（当前最优）|
+
+---
+
+## 七、表格数据（data/tables/）
+
+课件里的表格全部导出为 CSV（UTF-8 BOM 编码，Excel 双击可直接打开，中文不乱码）：
+
+| 文件 | 内容 | 对应页 |
+|---|---|---|
+| final_comparison.csv | 六种配置对比（迭代 / 棋盘和 / 期望得分 / 三档达成率）+ 理论最优 | 第 11 页 |
+| per_seed_results.csv | 三个种子的逐项终测指标 + 均值行 | 第 11 页（支撑行）|
+| hyperparameters.csv | 21 项训练超参数（取自最优检查点内保存的 args，最权威）| 第 5 页 |
+| game_replays.csv | 两段录像的对局元信息（种子 / 步数 / 得分 / 棋盘和 / 最大块）| 第 12 页 |
+| figures_index.csv | 15 张配图 → 所在页 → 数据来源文件 | 全部 |
+
+### 快速查看
+
+    # 终端里直接看
+    column -s, -t data/tables/final_comparison.csv
+
+    # Python 里读
+    import pandas as pd
+    df = pd.read_csv('data/tables/final_comparison.csv')
+    print(df)
+
+> 这些 CSV 由脚本从「课件 + 检查点 + 逐局数据」直接生成，不是手工抄写，
+> 因此与 pptx 里的表格逐字一致。

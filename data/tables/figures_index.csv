@@ -1,0 +1,16 @@
+﻿图文件,所在页,内容,数据来源
+s02_method_taxonomy.png,2,强化学习分类树,无（概念图）
+s03_task_model.png,3,3x3 任务建模,game2048_env.py（规则定义）
+s04_dual_tower.png,4,双塔网络结构,ppo.py 中的 ActorCritic
+s04_clip_formula.png,4,PPO-clip 公式,无（公式）
+s04_clip_chart.png,4,clip 直观示意,无（示意图）
+s05_hyperparams.png,5,超参数设置,tables/hyperparameters.csv
+s06_lr_schedule.png,6,三阶段学习率调度,logs/ultrafine_s*/ultrafine_s*_eval_log.csv 的 lr 列
+s07_ema.png,7,EMA 原理示意,无（概念图）
+s08_training_curves.png,8,score 与棋盘和随迭代变化,logs/validation_s*/eval_log.csv
+s09_thresholds.png,9,三档达成率曲线,logs/validation_s*/eval_log.csv 的 p>=128/256/512 列
+s10_lr_comparison.png,10,四种学习率调度对照,logs/ultrafine/ext2x/budget4x/fixedlr 的 eval_log.csv
+s12_game70151_poster.png,12,典型局第 200 步,render_videos.py + checkpoints/combo_s2.pt
+s12_game70151_final.png,12,典型局终局,同上
+s12_game70876_poster.png,12,1024 局第 400 步,同上
+s12_game70876_final.png,12,1024 局终局,同上

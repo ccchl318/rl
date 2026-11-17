@@ -68,3 +68,51 @@ data/
 ├── videos/        两局对局录像
 └── README.md
 ~~~
+
+---
+
+## 五、课件配图的原始文件（data/figures/）
+
+课件里每一张图都单独存了一份 PNG，可直接引用或重新排版：
+
+| 文件 | 对应页 | 内容 |
+|---|---|---|
+| s02_method_taxonomy.png | 第 2 页 | 强化学习分类树（PPO vs n-tuple TD）|
+| s03_task_model.png | 第 3 页 | 3×3 任务建模 |
+| s04_dual_tower.png | 第 4 页 | 双塔网络结构图 |
+| s04_clip_formula.png | 第 4 页 | PPO-clip 目标函数公式 |
+| s04_clip_chart.png | 第 4 页 | clip 的直观示意（Â>0 / Â<0）|
+| s05_hyperparams.png | 第 5 页 | 超参数设置表 |
+| s06_lr_schedule.png | 第 6 页 | 三阶段学习率调度曲线 |
+| s07_ema.png | 第 7 页 | EMA 原理示意 |
+| s08_training_curves.png | 第 8 页 | score 与棋盘和随迭代变化 |
+| s09_thresholds.png | 第 9 页 | 128 / 256 / 512 三档达成率 |
+| s10_lr_comparison.png | 第 10 页 | 四种学习率调度对照 |
+| s12_game70151_poster.png | 第 12 页 | 典型局（第 200 步，录像封面）|
+| s12_game70151_final.png | 第 12 页 | 典型局终局棋盘 |
+| s12_game70876_poster.png | 第 12 页 | 1024 局（第 400 步，录像封面）|
+| s12_game70876_final.png | 第 12 页 | 1024 局终局棋盘 |
+
+**这些图都是脚本生成的**，可复现：
+
+| 生成脚本 | 产出 |
+|---|---|
+| make_best_figs.py | figures/best/ 下 6 张报告图（fig1–fig6）|
+| render_videos.py | videos/ 下的对局 MP4；单帧可导出为 PNG |
+| eval_hidden.py | 任意检查点的 1,000 局终测（宽度自适应），产出 eval/ 下 CSV |
+
+> 说明：s02–s10 这些图是用排版脚本绘制的（文字/坐标轴为矢量转位图），
+> 其**数据来源**见下表"数据来源"列；图形本身可用 data/figures/ 中的 PNG 直接复用。
+
+---
+
+## 六、结果数据的完整查询路径
+
+| 想查什么 | 去哪看 |
+|---|---|
+| 某个模型的逐局结果 | eval/*_test_episodes.csv（列：seed, score, board_sum, max_tile, length）|
+| 各模型汇总指标 | eval/*_summary.json |
+| 训练过程曲线（含 lr / 熵 / KL）| logs/**/eval_log.csv、logs/**/train_log.csv |
+| 10,000 局大样本复核 | eval/validation_10k/*.csv（每模型一个文件）|
+| 课件结论与数据的对应关系 | 本文件第一节的表格 |
+| 完整实验报告 | 仓库根目录 BEST_CONFIG.md（当前最优）|

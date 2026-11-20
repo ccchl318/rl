@@ -178,7 +178,8 @@ def run_greedy_episodes(model: ActorCritic, n_episodes: int, seed: int = 12345,
 
 @torch.no_grad()
 def run_greedy_episodes_fast(model: ActorCritic, n_episodes: int, seed: int = 12345,
-                             device: str = "cpu", batch: int = 256):
+                             device: str = "cpu", batch: int = 256,
+                             return_raw: bool = False):
     """批量贪心评估：n_episodes 局并行执行，第 j 局固定种子 seed+j（per_env RNG 与
     旧环境逐位一致），结果与 run_greedy_episodes 完全等价，只是快得多。"""
     from game2048_env_fast import FastGame2048Batch
@@ -204,6 +205,8 @@ def run_greedy_episodes_fast(model: ActorCritic, n_episodes: int, seed: int = 12
                     results["board_sum"].append(bs)
                     results["length"].append(ln)
         n_done += b
+    if return_raw:
+        return {k: list(v) for k, v in results.items()}
     out = {k: (float(np.mean(v)), float(np.std(v))) for k, v in results.items()}
     for t in (128, 256, 512, 1024):
         out[f"p>={t}"] = (float(np.mean([m >= t for m in results["max_tile"]])), 0.0)

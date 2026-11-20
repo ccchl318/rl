@@ -149,8 +149,8 @@ def main():
         model.load_state_dict(ckpt["model"])
         model.eval()
         if args.env == "fast":
-            res = run_greedy_episodes_fast(model, args.episodes,
-                                           seed=args.seed, device=args.device)
+            res = run_greedy_episodes_fast(model, args.episodes, seed=args.seed,
+                                           device=args.device, return_raw=True)
             raw = res
             best_ep = None
             model_desc = (f"PPO greedy policy ({os.path.basename(args.ckpt)}, "

@@ -180,7 +180,7 @@ def main():
     for tile in sorted(tile_counter):
         n = tile_counter[tile]
         bar = "#" * int(round(60 * n / max(args.episodes, 1)))
-        lines.append(f"  {tile:5d}: {n:4d} ({n / args.episodes:5.1%}) {bar}")
+        lines.append(f"  {int(tile):5d}: {n:4d} ({n / args.episodes:5.1%}) {bar}")
     report = "\n".join(lines)
     print(report)
 
